@@ -97,7 +97,13 @@ append_version_ldflag VersionUBlock "$VERSION_UBLOCK"
 
 echo ">> module versions: amneziawg-go=${VERSION_AMNEZIA:-?} byedpi=${VERSION_BYEDPI:-?} masterdnsvpn=${VERSION_MASTERDNSVPN:-?} adblock-rust=${VERSION_ADBLOCK_RUST:-?} adblock-resources=${VERSION_ADBLOCK_RESOURCES:-?} uBlock=${VERSION_UBLOCK:-?}"
 
-GOMOBILE_TAGS="${GOMOBILE_TAGS:-with_conntrack,with_gvisor,with_quic,with_wireguard,with_awg,with_tailscale,with_utls,with_clash_api,with_naive_outbound,with_trusttunnel_cronet,with_adblock,with_adblock_cronet,with_grpc,badlinkname,tfogo_checklinkname0}"
+# http2legacy keeps golang.org/x/net/http2 on its own transport under Go 1.27.
+# Without it x/net wraps the standard library's HTTP/2 and the
+# (*Transport).connPool method that transport/v2rayhttp/force_close.go and
+# transport/v2rayxhttp/dialer.go reach with //go:linkname no longer exists, so
+# the link fails ("relocation target ... not defined"). Our x/net replacement
+# (LLC-INCY/x-net, 0.56.1-based) carries the same gate as upstream x/net.
+GOMOBILE_TAGS="${GOMOBILE_TAGS:-with_conntrack,with_gvisor,with_quic,with_wireguard,with_awg,with_tailscale,with_utls,with_clash_api,with_naive_outbound,with_trusttunnel_cronet,with_adblock,with_adblock_cronet,with_grpc,badlinkname,tfogo_checklinkname0,http2legacy}"
 gomobile bind -v -androidapi 23 ${GOMOBILE_TARGET:+-target ${GOMOBILE_TARGET}} -trimpath -ldflags="-s -w -checklinkname=0${VERSION_LDFLAGS}" -tags="$GOMOBILE_TAGS" . || exit 1
 rm -r libcore-sources.jar
 

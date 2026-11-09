@@ -39,6 +39,9 @@ fi
 cd "$PROJECT_ROOT"
 
 VERSION_SING_BOX="$(sed -nE 's/^VERSION_NAME=.*-([0-9]+)[[:space:]]*$/\1/p' nb4a.properties | tail -n1)"
+# Since 0.1.7 the version name is a plain x.y.z with no "-N" revision suffix
+# to derive the core's "-plus-N" tag from; the version name itself is the tag.
+[[ -n "$VERSION_SING_BOX" ]] || VERSION_SING_BOX="$(sed -nE 's/^VERSION_NAME=[[:space:]]*([^[:space:]]+)[[:space:]]*$/\1/p' nb4a.properties | tail -n1)"
 if [[ -z "$VERSION_SING_BOX" ]]; then
 	echo "Unable to derive VERSION_SING_BOX from nb4a.properties" >&2
 	exit 1
@@ -71,7 +74,7 @@ if [ -f "buildScript/lib/core/get_source_env.sh" ]; then
 	source "buildScript/lib/core/get_source_env.sh"
 fi
 
-GO_VERSION="${GO_VERSION:-1.26.5}"
+GO_VERSION="${GO_VERSION:-1.27.3}"
 BOOTSTRAP_GO_VERSION="${BOOTSTRAP_GO_VERSION:-1.26.5}"
 GO_PATCH_DIR="${GO_PATCH_DIR:-buildScript/lib/core/go-runtime-patches}"
 DOCKERFILE="${DOCKERFILE:-buildScript/lib/core/Dockerfile}"
