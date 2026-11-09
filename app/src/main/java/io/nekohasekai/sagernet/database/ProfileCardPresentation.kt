@@ -1,0 +1,173 @@
+package io.nekohasekai.sagernet.database
+
+import io.nekohasekai.sagernet.fmt.hysteria.HysteriaBean
+import io.nekohasekai.sagernet.fmt.mieru.MieruBean
+import io.nekohasekai.sagernet.fmt.v2ray.StandardV2RayBean
+import io.nekohasekai.sagernet.fmt.v2ray.isTLS
+
+private val insecureShadowsocksMethods = setOf(
+    "none",
+    "aes-128-ctr",
+    "aes-192-ctr",
+    "aes-256-ctr",
+    "aes-128-cfb",
+    "aes-192-cfb",
+    "aes-256-cfb",
+    "rc4-md5",
+    "chacha20-ietf",
+    "xchacha20",
+)
+
+private fun String?.isEnabledEncryption(): Boolean =
+    !isNullOrBlank() && !equals("none", ignoreCase = true)
+
+private fun String?.shortNetwork(): String = when (this?.lowercase()) {
+    "tcp" -> "TCP"
+    "ws" -> "WS"
+    "http", "h2" -> "HTTP"
+    "quic" -> "QUIC"
+    "grpc" -> "gRPC"
+    "xhttp" -> "XHTTP"
+    "httpupgrade" -> "HTTPUp"
+    null, "" -> "TCP"
+    else -> uppercase()
+}
+
+private fun StandardV2RayBean.transportEncryption(): String = when {
+    security.equals("reality", ignoreCase = true) -> "Reality"
+    security.equals("tls", ignoreCase = true) -> "TLS"
+    else -> "None"
+}
+
+private fun StandardV2RayBean.v2RayCardType(protocol: String): String =
+    "$protocol ${type.shortNetwork()} ${transportEncryption()}"
+
+fun ProxyEntity.profileCardType(): String = when (type) {
+    ProxyEntity.TYPE_SS -> "Shadowsocks ${ssBean?.method.orEmpty()}".trimEnd()
+    ProxyEntity.TYPE_SSR -> "ShadowsocksR ${ssrBean?.method.orEmpty()}".trimEnd()
+    ProxyEntity.TYPE_VMESS -> vmessBean?.let { bean ->
+        if (bean.isVLESS) {
+            buildString {
+                append(bean.v2RayCardType("VLESS"))
+                if (bean.vlessEncryption.isEnabledEncryption()) append(" ML-KEM")
+            }
+        } else {
+            bean.v2RayCardType("VMess")
+        }
+    } ?: displayType()
+    ProxyEntity.TYPE_TROJAN -> trojanBean?.v2RayCardType("Trojan") ?: displayType()
+    ProxyEntity.TYPE_TROJAN_GO -> {
+        val network = if (trojanGoBean?.type.equals("ws", ignoreCase = true)) "WS" else "TCP"
+        "Trojan-Go $network TLS"
+    }
+    ProxyEntity.TYPE_MIERU -> {
+        val network = if (mieruBean?.protocol == MieruBean.PROTOCOL_UDP) "UDP" else "TCP"
+        "Mieru $network"
+    }
+    ProxyEntity.TYPE_NAIVE -> "Naïve ${naiveBean?.proto.orEmpty().uppercase().ifBlank { "HTTPS" }}"
+    ProxyEntity.TYPE_HYSTERIA -> hysteriaBean?.let { bean ->
+        val network = if (bean.protocolVersion == 1) {
+            when (bean.protocol) {
+                HysteriaBean.PROTOCOL_FAKETCP -> "FakeTCP"
+                HysteriaBean.PROTOCOL_WECHAT_VIDEO -> "WeChat"
+                else -> "UDP"
+            }
+        } else {
+            "QUIC"
+        }
+        "Hysteria ${bean.protocolVersion ?: 2} $network"
+    } ?: displayType()
+    ProxyEntity.TYPE_TUIC -> "TUIC v${tuicBean?.protocolVersion ?: 5} QUIC"
+    ProxyEntity.TYPE_JUICITY -> "Juicity QUIC"
+    ProxyEntity.TYPE_SNELL -> snellBean?.let { bean ->
+        buildList {
+            add("Snell")
+            add("v${bean.version ?: 4}")
+            bean.network?.takeIf { it.isNotBlank() }?.let { add(it.uppercase()) }
+            bean.mode?.takeIf { it.isNotBlank() && it != "default" }?.let { add(it) }
+        }.joinToString(" ")
+    } ?: displayType()
+    ProxyEntity.TYPE_MASTERDNSVPN -> {
+        val encryption = when (masterDnsVPNBean?.dataEncryptionMethod) {
+            0 -> "None"
+            1 -> "XOR"
+            2 -> "ChaCha20"
+            3 -> "AES-128-GCM"
+            4 -> "AES-192-GCM"
+            5 -> "AES-256-GCM"
+            else -> "Unknown"
+        }
+        "MasterDnsVPN $encryption"
+    }
+    ProxyEntity.TYPE_SHADOWTLS -> "ShadowTLS v${shadowTLSBean?.version ?: 3} TLS"
+    ProxyEntity.TYPE_ANYTLS -> {
+        val encryption = if (anyTLSBean?.realityPubKey.isNullOrBlank()) "TLS" else "Reality"
+        "AnyTLS $encryption"
+    }
+    ProxyEntity.TYPE_TRUST_TUNNEL -> {
+        val network = if (trustTunnelBean?.quic == true) "QUIC" else "HTTPS"
+        "TrustTunnel $network"
+    }
+    ProxyEntity.TYPE_MASQUE -> {
+        val network = if (masqueBean?.useHTTP2 == true) "HTTP/2" else "HTTP/3"
+        "MASQUE $network"
+    }
+    else -> displayType()
+}
+
+private fun StandardV2RayBean.hasInsecureTls(globalAllowInsecure: Boolean): Boolean =
+    security.equals("tls", ignoreCase = true) && (allowInsecure == true || globalAllowInsecure)
+
+fun ProxyEntity.isInsecureProfile(globalAllowInsecure: Boolean): Boolean = when (type) {
+    ProxyEntity.TYPE_SOCKS -> true
+    ProxyEntity.TYPE_HTTP -> httpBean?.let { !it.isTLS() || it.hasInsecureTls(globalAllowInsecure) } == true
+    ProxyEntity.TYPE_SS -> ssBean?.method?.lowercase() in insecureShadowsocksMethods
+    ProxyEntity.TYPE_SSR -> true
+    ProxyEntity.TYPE_VMESS -> vmessBean?.let { bean ->
+        if (!bean.isVLESS) {
+            bean.hasInsecureTls(globalAllowInsecure)
+        } else if (bean.vlessEncryption.isEnabledEncryption()) {
+            false
+        } else {
+            when {
+                bean.security.equals("reality", ignoreCase = true) -> false
+                bean.security.equals("tls", ignoreCase = true) ->
+                    bean.allowInsecure == true || globalAllowInsecure
+                else -> true
+            }
+        }
+    } == true
+    ProxyEntity.TYPE_TROJAN ->
+        trojanBean?.hasInsecureTls(globalAllowInsecure) == true
+    ProxyEntity.TYPE_TROJAN_GO ->
+        trojanGoBean?.let { it.allowInsecure == true || globalAllowInsecure } == true
+    ProxyEntity.TYPE_HYSTERIA ->
+        hysteriaBean?.let { it.allowInsecure == true || globalAllowInsecure } == true
+    ProxyEntity.TYPE_SSH -> sshBean?.publicKey.isNullOrBlank()
+    ProxyEntity.TYPE_TUIC ->
+        tuicBean?.let { it.allowInsecure == true || globalAllowInsecure } == true
+    ProxyEntity.TYPE_JUICITY -> juicityBean?.let {
+        it.pinnedCertchainSha256.isNullOrBlank() &&
+                (it.allowInsecure == true || globalAllowInsecure)
+    } == true
+    ProxyEntity.TYPE_SNELL ->
+        snellBean?.let { it.version == 6 && it.mode.equals("unsafe-raw", ignoreCase = true) } == true
+    ProxyEntity.TYPE_MASTERDNSVPN ->
+        masterDnsVPNBean?.dataEncryptionMethod == 0
+    ProxyEntity.TYPE_SHADOWTLS ->
+        shadowTLSBean?.hasInsecureTls(globalAllowInsecure) == true
+    ProxyEntity.TYPE_ANYTLS -> anyTLSBean?.let {
+        it.realityPubKey.isNullOrBlank() && (it.allowInsecure == true || globalAllowInsecure)
+    } == true
+    ProxyEntity.TYPE_TRUST_TUNNEL -> trustTunnelBean?.let { bean ->
+        val usesCronet = bean.useCronetHttps == true ||
+                bean.utlsFingerprint == "cronet" ||
+                (bean.quic == true && bean.useCronetQuic == true)
+        !usesCronet &&
+                bean.certPublicKeySha256.isNullOrBlank() &&
+                (bean.allowInsecure == true || globalAllowInsecure)
+    } == true
+    ProxyEntity.TYPE_MASQUE ->
+        masqueBean?.let { it.tlsInsecure == true || globalAllowInsecure } == true
+    else -> false
+}

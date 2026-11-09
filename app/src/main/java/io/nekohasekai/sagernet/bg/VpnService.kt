@@ -1,0 +1,291 @@
+package io.nekohasekai.sagernet.bg
+
+import android.annotation.SuppressLint
+import android.app.Service
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.ProxyInfo
+import android.os.Build
+import android.os.ParcelFileDescriptor
+import android.os.PowerManager
+import android.os.SystemClock
+import io.nekohasekai.sagernet.*
+import io.nekohasekai.sagernet.database.DataStore
+import io.nekohasekai.sagernet.database.SagerDatabase
+import io.nekohasekai.sagernet.fmt.LOCALHOST
+import io.nekohasekai.sagernet.fmt.hysteria.HysteriaBean
+import io.nekohasekai.sagernet.ktx.*
+import io.nekohasekai.sagernet.ui.VpnRequestActivity
+import kotlinx.coroutines.delay
+import moe.matsuri.nb4a.utils.NGUtil.isPureIpAddress
+import android.net.VpnService as BaseVpnService
+
+class VpnService :
+    BaseVpnService(),
+    BaseService.Interface {
+    companion object {
+        private const val VPN_NETWORK_TEARDOWN_TIMEOUT_MS = 1_500L
+        private const val VPN_NETWORK_TEARDOWN_POLL_MS = 100L
+    }
+
+    var conn: ParcelFileDescriptor? = null
+
+    private var metered = false
+
+    override var upstreamInterfaceName: String? = null
+
+    override suspend fun startProcesses() {
+        DataStore.vpnService = this
+        super.startProcesses() // launch proxy instance
+    }
+
+    override var wakeLock: PowerManager.WakeLock? = null
+
+    @SuppressLint("WakelockTimeout")
+    override fun acquireWakeLock() {
+        wakeLock =
+            SagerNet.power
+                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "sagernet:vpn")
+                .apply { acquire() }
+    }
+
+    @Suppress("EXPERIMENTAL_API_USAGE")
+    override fun killProcesses() {
+        try {
+            super.killProcesses()
+        } finally {
+            conn?.let {
+                Logs.d("Closing Android VPN file descriptor")
+                runCatching {
+                    it.close()
+                }.onFailure { error ->
+                    Logs.w(error)
+                }
+                Logs.d("Android VPN file descriptor closed")
+            }
+            conn = null
+        }
+    }
+
+    override suspend fun beforeRestartAfterStop() {
+        val deadline = SystemClock.elapsedRealtime() + VPN_NETWORK_TEARDOWN_TIMEOUT_MS
+        while (SystemClock.elapsedRealtime() < deadline && isVpnNetwork(SagerNet.connectivity.activeNetwork)) {
+            delay(VPN_NETWORK_TEARDOWN_POLL_MS)
+        }
+        if (isVpnNetwork(SagerNet.connectivity.activeNetwork)) {
+            Logs.w("VPN network still active after teardown wait")
+        }
+    }
+
+    override fun onBind(intent: Intent) =
+        when (intent.action) {
+            SERVICE_INTERFACE -> super<BaseVpnService>.onBind(intent)
+            else -> super<BaseService.Interface>.onBind(intent)
+        }
+
+    override val data = BaseService.Data(this)
+    override val tag = "SagerNetVpnService"
+
+    override fun createNotification(profileName: String) = ServiceNotification(this, profileName, "service-vpn")
+
+    override fun onStartCommand(
+        intent: Intent?,
+        flags: Int,
+        startId: Int,
+    ): Int {
+        if (DataStore.serviceMode == Key.MODE_VPN) {
+            if (LocalNetworkPermission.isRequired(this, DataStore.tunImplementation)) {
+                DataStore.tunImplementation = TunImplementation.GVISOR
+            }
+            if (prepare(this) != null) {
+                startActivity(
+                    Intent(
+                        this,
+                        VpnRequestActivity::class.java,
+                    ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                )
+            } else {
+                return super<BaseService.Interface>.onStartCommand(intent, flags, startId)
+            }
+        }
+        stopRunner()
+        return Service.START_NOT_STICKY
+    }
+
+    inner class NullConnectionException :
+        NullPointerException(),
+        BaseService.ExpectedException {
+        override fun getLocalizedMessage() = getString(R.string.reboot_required)
+    }
+
+    fun startVpn(
+        tunPayloadJson: String,
+        @Suppress("UNUSED_PARAMETER") tunPlatformOptionsJson: String,
+    ): Int {
+        // The address, DNS, MTU and route ranges come from the authoritative
+        // payload produced by libcore (flattened from sing-box's effective TUN
+        // options). Only per-app routing, HTTP proxy, metering, the session name
+        // and the ParcelFileDescriptor lifecycle remain app-owned below.
+        val plan = AndroidTunPayload.parse(tunPayloadJson)
+        val builder =
+            Builder()
+                .setConfigureIntent(SagerNet.configureIntent(this))
+                .setSession(getString(R.string.app_name))
+                .setMtu(plan.mtu)
+
+        // interface addresses (IPv4 and/or IPv6, never an unrequested family)
+        plan.inet4Address?.let { builder.addAddress(it.address, it.prefixLength) }
+        plan.inet6Address?.let { builder.addAddress(it.address, it.prefixLength) }
+
+        // in-TUN DNS servers (next address of each declared family's prefix)
+        plan.inet4DnsServer?.let { builder.addDnsServer(it) }
+        plan.inet6DnsServer?.let { builder.addDnsServer(it) }
+
+        // route ranges flattened by sing-box BuildAutoRouteRanges(true)
+        plan.inet4Routes.forEach { builder.addRoute(it.address, it.prefixLength) }
+        plan.inet6Routes.forEach { builder.addRoute(it.address, it.prefixLength) }
+
+        updateUnderlyingNetwork(builder)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) builder.setMetered(metered)
+
+        // app route
+        val packageName = packageName
+        val proxyApps = DataStore.proxyApps
+        val adblockSystemWideFilter = DataStore.adblockSystemWideFilter
+        var bypass = DataStore.bypass
+        val workaroundSYSTEM = false // DataStore.tunImplementation == TunImplementation.SYSTEM
+        val needBypassRootUid =
+            workaroundSYSTEM ||
+                data.proxy!!.config.trafficMap.values.any {
+                    it[0].hysteriaBean?.protocol == HysteriaBean.PROTOCOL_FAKETCP
+                }
+
+        // List of all per-rule packages where outbound is not Bypass.
+        // This adds those packages to the TUN package list and enables user-defined rules for them.
+        // We don't mess with bypass since we can't guarantee that the rule will match because
+        // runtime changes like network change may have an effect on that.
+        val packagesFromRules: List<String> =
+            SagerDatabase.rulesDao
+                .enabledRules()
+                .flatMap { rule ->
+                    if (rule.packages.isNotEmpty() && rule.outbound != -1L) {
+                        rule.packages
+                    } else {
+                        emptySet()
+                    }
+                }.map { it.trim() }
+                .filter { it.isNotBlank() }
+                .distinct()
+        val adblockPackages =
+            DataStore.adblockIncludedPackages
+                .lineSequence()
+                .map { it.trim() }
+                .filter { it.isNotBlank() }
+                .distinct()
+                .toList()
+
+        if (proxyApps || adblockSystemWideFilter || needBypassRootUid) {
+            val individual = mutableSetOf<String>()
+            val allApps by lazy {
+                packageManager
+                    .getInstalledApplications(PackageManager.GET_META_DATA)
+                    .map { it.packageName }
+                    .filter { it != packageName }
+            }
+            if (adblockSystemWideFilter) {
+                individual.addAll(allApps)
+                bypass = false
+            } else if (proxyApps) {
+                individual.addAll(
+                    DataStore.individual
+                        .lineSequence()
+                        .map { it.trim() }
+                        .filter { it.isNotBlank() },
+                )
+
+                if (!bypass) {
+                    individual.addAll(packagesFromRules)
+                    individual.addAll(adblockPackages)
+                } else {
+                    individual.removeAll(packagesFromRules.toSet())
+                    individual.removeAll(adblockPackages.toSet())
+                }
+
+                if (bypass && needBypassRootUid) {
+                    val individualNew = allApps.toMutableList()
+                    individualNew.removeAll(individual)
+                    individual.clear()
+                    individual.addAll(individualNew)
+                    bypass = false
+                }
+            } else {
+                individual.addAll(allApps)
+                bypass = false
+            }
+
+            val added = mutableListOf<String>()
+
+            individual
+                .apply {
+                    // Allow Matsuri itself using VPN.
+                    remove(packageName)
+                    if (!bypass) add(packageName)
+                }.forEach {
+                    try {
+                        if (bypass) {
+                            builder.addDisallowedApplication(it)
+                        } else {
+                            builder.addAllowedApplication(it)
+                        }
+                        added.add(it)
+                    } catch (ex: PackageManager.NameNotFoundException) {
+                        Logs.w(ex)
+                    }
+                }
+
+            if (bypass) {
+                Logs.d("Add bypass: ${added.joinToString(", ")}")
+            } else {
+                Logs.d("Add allow: ${added.joinToString(", ")}")
+            }
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && DataStore.appendHttpProxy && DataStore.requireProxyInVPN) {
+            builder.setHttpProxy(
+                ProxyInfo.buildDirectProxy(
+                    when {
+                        isPureIpAddress(DataStore.mixedListener) -> DataStore.mixedListener
+                        else -> LOCALHOST
+                    },
+                    DataStore.mixedPort,
+                    DataStore.httpProxyBypass.lines().mapNotNull { line ->
+                        line.trim().takeIf { it.isNotBlank() && !it.startsWith("#") }
+                    },
+                ),
+            )
+        }
+
+        metered = DataStore.meteredNetwork
+        if (Build.VERSION.SDK_INT >= 29) builder.setMetered(metered)
+        conn = builder.establish() ?: throw NullConnectionException()
+
+        return conn!!.fd
+    }
+
+    fun updateUnderlyingNetwork(builder: Builder? = null) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
+            SagerNet.underlyingNetwork?.let {
+                builder?.setUnderlyingNetworks(arrayOf(SagerNet.underlyingNetwork))
+                    ?: setUnderlyingNetworks(arrayOf(SagerNet.underlyingNetwork))
+            }
+        }
+    }
+
+    override fun onRevoke() = stopRunner()
+
+    override fun onDestroy() {
+        DataStore.vpnService = null
+        super.onDestroy()
+        data.binder.close()
+    }
+}
